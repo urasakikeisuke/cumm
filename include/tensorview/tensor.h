@@ -101,41 +101,60 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <iomanip>
 #include <memory>
 #include <type_traits>
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
 #include "cuda/driverops.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 #include <curand.h>
 #endif
-#if (CUDA_VERSION >= 11000 && defined(TV_CUDA))
+#if (CUDA_VERSION >= 11000 && defined(TV_HARDWARE_ACC_CUDA))
 #include <cuda_bf16.h>
 #endif
-#if (CUDA_VERSION >= 11080 && defined(TV_CUDA))
+#if (CUDA_VERSION >= 11080 && defined(TV_HARDWARE_ACC_CUDA))
 #include <cuda_fp8.h>
+#endif
+
+#ifdef TV_HARDWARE_ACC_METAL
+#include "Metal/Metal.hpp"
 #endif
 
 #include <random>
 
 namespace tv {
+
+enum DeviceType {
+  kDeviceCPU = -1,
+  kDeviceCUDA = 0,
+};
+
+class Tensor;
+
 namespace detail {
 
 using dtype_collection_t =
     mp_list_c<int, float32, int32, int16, int8, float64, bool_, uint8, float16,
               int64, uint16, uint32, uint64>;
 
-#if defined(TV_CUDA) && CUDA_VERSION < 11000
+#if defined(TV_HARDWARE_ACC_CUDA) && CUDA_VERSION < 11000
 using all_tensor_types_t =
     std::tuple<float, double, int8_t, int16_t, int32_t, int64_t, uint8_t,
                uint16_t, uint32_t, uint64_t, bool, __half>;
-#elif defined(TV_CUDA) && CUDA_VERSION >= 11000
+#elif defined(TV_HARDWARE_ACC_CUDA) && CUDA_VERSION >= 11000
 using all_tensor_types_t =
     std::tuple<float, double, int8_t, int16_t, int32_t, int64_t, uint8_t,
                uint16_t, uint32_t, uint64_t, bool, __half, __nv_bfloat16>;
 #else
+#ifdef TV_HARDWARE_ACC_METAL
 using all_tensor_types_t =
     std::tuple<float, double, int8_t, int16_t, int32_t, int64_t, uint8_t,
                uint16_t, uint32_t, uint64_t, bool>;
+#else
+using all_tensor_types_t =
+    std::tuple<float, double, int8_t, int16_t, int32_t, int64_t, uint8_t,
+               uint16_t, uint32_t, uint64_t, bool>;
+
+#endif
 #endif
 
 using all_tensor_types_print_t =
@@ -146,7 +165,21 @@ using all_int_tensor_types_t =
     std::tuple<int8_t, int16_t, int32_t, int64_t, uint8_t, uint16_t, uint32_t,
                uint64_t>;
 
+template <typename T, typename U>
+struct is_convertible : std::is_convertible<T, U> {};
+
+#if defined(TV_HARDWARE_ACC_CUDA)
+template <typename T>
+struct is_convertible<T, __half> : std::is_floating_point<T> {};
+#endif
+
+#if (CUDA_VERSION >= 11000 && defined(TV_HARDWARE_ACC_CUDA))
+template <typename T>
+struct is_convertible<T, __nv_bfloat16> : std::is_floating_point<T> {};
+#endif
+
 template <typename T> class TensorStorage {
+  // friend Tensor;
 public:
   TensorStorage(size_t size, int device = -1, bool managed = false,
                 bool pinned = false)
@@ -155,34 +188,96 @@ public:
       ptr_ = nullptr;
     } else {
       if (device == -1) {
+        if (pinned || managed) {
+          TV_ASSERT_INVALID_ARG(
+              pinned ^ managed,
+              "cpu tensor can't be managed (shared in apple silicon)");
+        }
         if (pinned_) {
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
           checkCudaErrors(cudaMallocHost(&ptr_, size * sizeof(T)));
 #else
-          TV_THROW_INVALID_ARG("you need to define TV_CUDA to use pinned");
+          TV_THROW_INVALID_ARG("you need to define TV_ENABLE_HARDWARE_ACC to "
+                               "use pinned, only cuda support this.");
+#endif
+        } else if (managed) {
+#if defined(TV_HARDWARE_ACC_CUDA)
+          checkCudaErrors(cudaMallocManaged(&this->ptr_, size * sizeof(T)));
+#elif defined(TV_HARDWARE_ACC_METAL)
+          ptr_mtl_device_ = MTL::CreateSystemDefaultDevice();
+          TV_ASSERT_RT_ERR(ptr_mtl_device_, "Metal device not found");
+          ptr_mtl_ =
+              ptr_mtl_device_->newBuffer(size, MTL::ResourceStorageModeShared);
+          TV_ASSERT_RT_ERR(ptr_mtl_, "Metal buffer not created");
+          ptr_ = reinterpret_cast<T *>(ptr_mtl_->contents());
+#else
+          TV_THROW_INVALID_ARG("don't compiled with cuda or metal");
 #endif
         } else {
           ptr_ = new T[size];
         }
       } else {
-#ifdef TV_CUDA
-        if (managed) {
-          checkCudaErrors(cudaMallocManaged(&this->ptr_, size * sizeof(T)));
-        } else {
-          checkCudaErrors(cudaMalloc(&ptr_, size * sizeof(T)));
-        }
+        TV_ASSERT_INVALID_ARG(!managed && !pinned,
+                              "only cpu tensor can be managed or pinned");
+#if defined(TV_HARDWARE_ACC_CUDA)
+        checkCudaErrors(cudaMalloc(&ptr_, size * sizeof(T)));
+#elif defined(TV_HARDWARE_ACC_METAL)
+        ptr_mtl_device_ = MTL::CreateSystemDefaultDevice();
+        TV_ASSERT_RT_ERR(ptr_mtl_device_, "Metal device not found");
+        ptr_mtl_ =
+            ptr_mtl_device_->newBuffer(size, MTL::ResourceStorageModePrivate);
+        TV_ASSERT_RT_ERR(ptr_mtl_, "Metal buffer not created");
+        ptr_ = nullptr;
+        TV_ASSERT_INVALID_ARG(is_private(), "should be private buffer");
 #else
         TV_THROW_INVALID_ARG("don't compiled with cuda");
 #endif
       }
     }
   }
-  TensorStorage(T *ptr, size_t size, int device)
-      : size_(size), ptr_(ptr), from_blob_(true), device_(device) {
-      if (size == 0) {
-        ptr_ = nullptr;
+  TensorStorage(T *ptr, size_t size, int device, int storage_offset = 0,
+                bool managed = false)
+      : size_(size), ptr_(ptr), from_blob_(true), device_(device),
+        managed_(managed) {
+    if (size == 0) {
+      ptr_ = nullptr;
+    }
+#ifdef TV_HARDWARE_ACC_METAL
+    if (device == 0) {
+      if (managed) {
+        // pytorch don't have managed, so we assume the ptr come from
+        // tensorview, so it's data ptr, not buffer ptr.
+        ptr_mtl_device_ = MTL::CreateSystemDefaultDevice();
+        TV_ASSERT_RT_ERR(ptr_mtl_device_, "Metal device not found");
+
+        int alignedLength = 0;
+        void *host_dst = ptr;
+        void *alignedPtr = detail::pageAlignedBlockPtr(
+            host_dst, int(size * sizeof(T)), &alignedLength);
+        int destOffset = (uintptr_t(host_dst) - uintptr_t(alignedPtr));
+        // 4 bytes alignment required on macos for blits.
+        TV_ASSERT_RT_ERR(destOffset % 4 == 0, "Unaligned blit request");
+        TV_ASSERT_RT_ERR(destOffset % sizeof(T) == 0, "should not happen");
+        ptr_ = reinterpret_cast<T *>(alignedPtr);
+        ptr_mtl_ = ptr_mtl_device_->newBuffer(
+            alignedPtr, alignedLength, MTL::ResourceStorageModeShared, nullptr);
+        TV_ASSERT_RT_ERR(ptr_mtl_, "Metal buffer not created", PAGE_SIZE);
+        offset_ = destOffset / sizeof(T);
+      } else {
+        // assume the ptr is come from torch mps
+        // then the ptr is Buffer ptr, not data ptr
+        // pytorch mps tensor use private buffer, so we can't
+        // get the pointer, pytorch can't get the pointer too.
+
+        // https://stackoverflow.com/questions/76989609/how-to-convert-a-idmtlcommandqueue-to-a-mtlcommandqueue-of-metal-cpp
+        MTL::Buffer *buffer = reinterpret_cast<MTL::Buffer *>(ptr);
+        ptr_mtl_ = buffer;
+        offset_ = storage_offset;
+        return;
       }
     }
+#endif
+  }
 
   virtual ~TensorStorage() {
     if (empty()) {
@@ -193,43 +288,149 @@ public:
     }
     if (device_ == -1) {
       if (pinned_) {
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
         cudaFreeHost(ptr_);
+#endif
+      } else if (managed_) {
+#if defined(TV_HARDWARE_ACC_CUDA)
+        cudaFree(ptr_);
+#elif defined(TV_HARDWARE_ACC_METAL)
+        if (ptr_mtl_ != nullptr) {
+          ptr_mtl_->release();
+          ptr_mtl_ = nullptr;
+        }
+        if (ptr_mtl_device_ != nullptr) {
+          ptr_mtl_device_->release();
+          ptr_mtl_device_ = nullptr;
+        }
+        ptr_ = nullptr;
 #endif
       } else {
         delete[] ptr_;
       }
     } else {
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
       cudaFree(ptr_);
+#endif
+#ifdef TV_HARDWARE_ACC_METAL
+      if (ptr_mtl_ != nullptr) {
+        ptr_mtl_->release();
+        ptr_mtl_ = nullptr;
+      }
+      if (ptr_mtl_device_ != nullptr) {
+        ptr_mtl_device_->release();
+        ptr_mtl_device_ = nullptr;
+      }
 #endif
     }
   };
 
   inline size_t size() const { return size_; }
+  inline size_t byte_size() const { return size_ * sizeof(T); }
 
-  T *data() { return ptr_; }
-  const T *data() const { return ptr_; }
+#ifdef TV_HARDWARE_ACC_METAL
+  const auto *apple_metal_buffer_ptr() const { return ptr_mtl_; }
+  auto *apple_metal_buffer_ptr() { return ptr_mtl_; }
+#endif
+  T *data() {
+#ifdef TV_HARDWARE_ACC_METAL
+    TV_ASSERT_INVALID_ARG(
+        !is_private(),
+        "you can't access pointer of private buffer, currently only apple "
+        "buffer can be private. only gpu kernels can access private data.");
+#endif
+    return ptr_ + offset_;
+  }
+  const T *data() const {
+#ifdef TV_HARDWARE_ACC_METAL
+    TV_ASSERT_INVALID_ARG(
+        !is_private(),
+        "you can't access pointer of private buffer, currently only apple "
+        "buffer can be private. only gpu kernels can access private data.");
+#endif
+    return ptr_ + offset_;
+  }
   bool is_cpu() const { return device_ == -1; }
 
-  bool empty() const { return ptr_ == nullptr || size_ == 0; }
+  bool empty() const {
+#ifdef TV_HARDWARE_ACC_METAL
+    if (!is_cpu()) {
+      return ptr_mtl_ == nullptr || size_ == 0;
+    } else {
+      if (managed_) {
+        return ptr_mtl_ == nullptr || size_ == 0;
+      } else {
+        return ptr_ == nullptr || size_ == 0;
+      }
+    }
+#else
+    return ptr_ == nullptr || size_ == 0;
+#endif
+  }
   bool managed() const { return managed_; }
   bool pinned() const { return pinned_; }
-
+  size_t offset() const { return offset_; }
+  size_t byte_offset() const { return offset_ * sizeof(T); }
+  bool is_private() const {
+#ifdef TV_HARDWARE_ACC_METAL
+    return ptr_ == nullptr && ptr_mtl_ != nullptr;
+#else
+    return false;
+#endif
+  }
+  std::uintptr_t gpu_address() const {
+    TV_ASSERT_INVALID_ARG(!is_cpu(), "only support gpu tensor");
+#if defined(TV_HARDWARE_ACC_CUDA)
+    std::uintptr_t address = reinterpret_cast<std::uintptr_t>(ptr_);
+    return address;
+#elif defined(TV_HARDWARE_ACC_METAL)
+    TV_ASSERT_INVALID_ARG(ptr_mtl_ != nullptr, "invalid metal buffer");
+    return std::uintptr_t(ptr_mtl_->gpuAddress());
+#else
+    TV_THROW_RT_ERR("only support gpu tensor");
+#endif
+  }
   int device() const { return device_; }
   void zero_(int64_t offset, int64_t length, Context ctx = Context()) {
+    if (size_ == 0) {
+      TV_ASSERT_INVALID_ARG(
+          offset == 0 && length == 0,
+          "when you zero a empty tensor, offset and length should be 0");
+      return;
+    }
     TV_ASSERT_RT_ERR(length <= size_ - offset, "eror");
-    if (device_ == -1) {
+    int target_device = device_;
+#ifdef TV_HARDWARE_ACC_METAL
+    target_device = 0; // for apple m cpu, all buffer are shared.
+#endif
+    if (target_device == -1) {
       std::memset(data() + offset, 0, length);
       // std::fill(data(), data() + size_, 0);
     } else {
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
       if (ctx.has_cuda_stream()) {
         checkCudaErrors(cudaMemsetAsync(data() + offset * sizeof(T), 0,
                                         length * sizeof(T), ctx.cuda_stream()));
       } else {
         checkCudaErrors(
             cudaMemset(data() + offset * sizeof(T), 0, length * sizeof(T)));
+      }
+#elif defined(TV_HARDWARE_ACC_METAL)
+      AppleMetalContext::SyncType sync_type =
+          AppleMetalContext::SyncType::COMMIT;
+      if (!ctx.has_item(ContextType::kAppleMetal)) {
+        ctx = Context().create_apple_metal_context();
+        sync_type = AppleMetalContext::SyncType::COMMIT_AND_WAIT;
+      }
+      auto *metal_ctx = reinterpret_cast<AppleMetalContext *>(
+          ctx.get_item(ContextType::kAppleMetal));
+      if (ptr_mtl_ == nullptr) {
+        TV_ASSERT_RT_ERR(ptr_ != nullptr, "invalid ptr, shouldn't happen");
+        metal_ctx->fill_raw(ptr_, byte_offset() + offset * sizeof(T), length, 0,
+                            sync_type);
+      } else {
+        metal_ctx->fill(ptr_mtl_, byte_offset() + offset * sizeof(T), length, 0,
+                        sync_type);
       }
 #else
       TV_THROW_INVALID_ARG("don't compiled with cuda");
@@ -238,7 +439,96 @@ public:
   }
 
   void zero_whole_(Context ctx = Context()) { return zero_(0, size_, ctx); }
-
+  void copy_(const TensorStorage<T> &src, Context ctx = Context()) {
+    TV_ASSERT_INVALID_ARG(size_ == src.size_, "size not match");
+    if (size_ == 0) {
+      return;
+    }
+    copy(src, 0, *this, 0, size_, ctx);
+  }
+  static void copy(const TensorStorage<T> &src, size_t src_offset,
+                   TensorStorage<T> &dst, size_t dst_offset, size_t copy_size,
+                   Context ctx = Context()) {
+    if (copy_size == 0) {
+      return;
+    }
+    TV_ASSERT_INVALID_ARG(src.size_ >= src_offset + copy_size,
+                          "src size not match");
+    TV_ASSERT_INVALID_ARG(dst.size_ >= dst_offset + copy_size,
+                          "dst size not match");
+#if defined(TV_HARDWARE_ACC_CUDA)
+    if (src.device_ == -1 && dst.device_ == -1) {
+      std::copy(src.data() + src_offset, src.data() + src_offset + copy_size,
+                dst.data() + dst_offset);
+    } else if (src.device_ == -1 && dst.device_ != -1) {
+      if (ctx.has_cuda_stream()) {
+        host2dev(dst.data() + dst_offset, src.data() + src_offset,
+                 copy_size, ctx.cuda_stream());
+      } else {
+        host2dev(dst.data() + dst_offset, src.data() + src_offset,
+                 copy_size);
+      }
+    } else if (src.device_ != -1 && dst.device_ == -1) {
+      if (ctx.has_cuda_stream()) {
+        dev2host(dst.data() + dst_offset, src.data() + src_offset,
+                 copy_size, ctx.cuda_stream());
+      } else {
+        dev2host(dst.data() + dst_offset, src.data() + src_offset,
+                 copy_size);
+      }
+    } else {
+      if (ctx.has_cuda_stream()) {
+        dev2dev(dst.data() + dst_offset, src.data() + src_offset,
+                copy_size, ctx.cuda_stream());
+      } else {
+        dev2dev(dst.data() + dst_offset, src.data() + src_offset,
+                copy_size);
+      }
+    }
+#elif defined(TV_HARDWARE_ACC_METAL)
+    size_t copy_size_in_bytes = copy_size * sizeof(T);
+    AppleMetalContext::SyncType sync_type = AppleMetalContext::SyncType::COMMIT;
+    if (!ctx.has_item(ContextType::kAppleMetal)) {
+      ctx = Context().create_apple_metal_context();
+      sync_type = AppleMetalContext::SyncType::COMMIT_AND_WAIT;
+    }
+    auto *metal_ctx = reinterpret_cast<AppleMetalContext *>(
+        ctx.get_item(ContextType::kAppleMetal));
+    if (src.ptr_mtl_ == nullptr && dst.ptr_mtl_ == nullptr) {
+      // always cpu to cpu, just use std copy
+      std::copy(src.data() + src_offset, src.data() + src_offset + copy_size,
+                dst.data() + dst_offset);
+    } else if (src.ptr_mtl_ == nullptr && dst.ptr_mtl_ != nullptr) {
+      auto ptr = src.ptr_;
+      TV_ASSERT_RT_ERR(ptr != nullptr, "invalid ptr, shouldn't happen");
+      metal_ctx->copy_src_raw(ptr, src.byte_size(), dst.ptr_mtl_,
+                              src.byte_offset() + src_offset * sizeof(T),
+                              dst.byte_offset() + dst_offset * sizeof(T),
+                              copy_size_in_bytes, sync_type);
+    } else if (src.ptr_mtl_ != nullptr && dst.ptr_mtl_ == nullptr) {
+      // when copy to a cpu tensor, we always do sync.
+      auto ptr = dst.ptr_;
+      TV_ASSERT_RT_ERR(ptr != nullptr, "invalid ptr, shouldn't happen");
+      metal_ctx->copy_dst_raw(src.ptr_mtl_, ptr, dst.byte_size(),
+                              src.byte_offset() + src_offset * sizeof(T),
+                              dst.byte_offset() + dst_offset * sizeof(T),
+                              copy_size_in_bytes,
+                              AppleMetalContext::SyncType::COMMIT_AND_WAIT);
+    } else {
+      metal_ctx->copy(src.ptr_mtl_, dst.ptr_mtl_,
+                      src.byte_offset() + src_offset * sizeof(T),
+                      dst.byte_offset() + dst_offset * sizeof(T),
+                      copy_size_in_bytes, sync_type);
+    }
+#else
+    if (src.device_ == -1 && dst.device_ == -1) {
+      std::copy(src.data() + src_offset, src.data() + src_offset + copy_size,
+                dst.data() + dst_offset);
+    } else {
+      TV_THROW_RT_ERR("only support cpu tensor");
+    }
+#endif
+  }
   std::shared_ptr<TensorStorage<T>> clone(Context ctx = Context()) {
     // clone whole storage
     auto new_storage_ptr =
@@ -246,38 +536,18 @@ public:
     if (size_ == 0) {
       return new_storage_ptr;
     }
-    if (device_ == -1) {
+    new_storage_ptr->copy_(*this, ctx);
+    return new_storage_ptr;
+  }
 
-      if (pinned_) {
-#ifdef TV_CUDA
-        if (ctx.has_cuda_stream()) {
-          host2host(new_storage_ptr->ptr_, ptr_, size_ * sizeof(T),
-                    ctx.cuda_stream());
-        } else {
-          host2host(new_storage_ptr->ptr_, ptr_, size_ * sizeof(T));
-        }
-#else
-        std::copy(ptr_, ptr_ + size_ * sizeof(T), new_storage_ptr->ptr_);
-#endif
-      } else {
-        // use memcpy instead to avoid cuda context init
-        std::copy(ptr_, ptr_ + size_ * sizeof(T), new_storage_ptr->ptr_);
-      }
+  std::shared_ptr<TensorStorage<T>> cpu(Context ctx = Context()) {
+    // clone whole storage
+    auto new_storage_ptr =
+        std::make_shared<TensorStorage<T>>(size_, -1, managed_, pinned_);
+    if (size_ == 0) {
+      return new_storage_ptr;
     }
-#ifdef TV_CUDA
-    else {
-      if (ctx.has_cuda_stream()) {
-        dev2dev(new_storage_ptr->ptr_, ptr_, size_ * sizeof(T),
-                ctx.cuda_stream());
-      } else {
-        dev2dev(new_storage_ptr->ptr_, ptr_, size_ * sizeof(T));
-      }
-    }
-#else
-    else {
-      TV_THROW_RT_ERR("only support cpu tensor");
-    }
-#endif
+    new_storage_ptr->copy_(*this, ctx);
     return new_storage_ptr;
   }
 
@@ -288,6 +558,12 @@ private:
   int device_ = -1;
   bool managed_ = false;
   bool pinned_ = false;
+  size_t offset_ = 0;
+
+#ifdef TV_HARDWARE_ACC_METAL
+  MTL::Buffer *ptr_mtl_ = nullptr;
+  MTL::Device *ptr_mtl_device_ = nullptr;
+#endif
 };
 
 template <typename T> size_t sizeof_dtype(T dtype) {
@@ -316,18 +592,14 @@ template <typename T> size_t sizeof_dtype(T dtype) {
     return sizeof(uint64_t);
   case float16:
     return 2;
-#if (CUDA_VERSION >= 11000 && defined(TV_CUDA))
   case bfloat16:
     return 2;
   case tf32:
     return sizeof(float);
-#endif
-#if (CUDA_VERSION >= 11080 && defined(TV_CUDA))
   case float_e4m3:
     return 1;
   case float_e5m2:
     return 1;
-#endif
   case custom16:
     return 2;
   case custom32:
@@ -353,7 +625,7 @@ template <class Tsrc, class Tdst> struct ConvertTmpType {
   static constexpr bool kSpec = false;
 };
 
-#if (CUDA_VERSION >= 11000 && defined(TV_CUDA))
+#if (CUDA_VERSION >= 11000 && defined(TV_HARDWARE_ACC_CUDA))
 template <class T> struct ConvertTmpType<T, __nv_bfloat16> {
   using type = float;
   static constexpr bool kSpec = true;
@@ -585,17 +857,20 @@ using TensorShape = ShapeBase<kTensorMaxDim, int64_t>;
 
 struct Tensor {
   // empty tensor will have float32 dtype by default.
-  Tensor(): dtype_(tv::float32) {}
+  Tensor() : dtype_(tv::float32) {}
   Tensor(TensorShape shape, TensorShape stride, DType dtype, int device = -1,
          bool pinned = false, bool managed = false)
       : dtype_(dtype) {
-    
+
     // TV_ASSERT_INVALID_ARG(!shape.empty(), "dont support empty shape");
     storage_ = std::make_shared<detail::TensorStorage<uint8_t>>(
         shape.size() * detail::sizeof_dtype(dtype), device, managed, pinned);
     shape_ = shape;
     stride_ = stride;
     contiguous_ = compute_is_contiguous();
+    TV_ASSERT_RT_ERR(
+        contiguous_,
+        "stride must be contiguous when you create tensor from shape");
   }
 
   Tensor(TensorShape shape, DType dtype, int device = -1, bool pinned = false,
@@ -609,44 +884,50 @@ struct Tensor {
     contiguous_ = compute_is_contiguous();
   }
   Tensor(void *ptr, TensorShape shape, TensorShape stride, DType dtype,
-         int device = -1)
+         int device = -1, int storage_offset = 0)
       : dtype_(dtype) {
     // TV_ASSERT_INVALID_ARG(!shape.empty(), "dont support empty shape");
+    auto itemsize = detail::sizeof_dtype(dtype);
     storage_ = std::make_shared<detail::TensorStorage<uint8_t>>(
-        reinterpret_cast<uint8_t *>(ptr),
-        shape.size() * detail::sizeof_dtype(dtype), device);
+        reinterpret_cast<uint8_t *>(ptr), shape.size() * itemsize, device,
+        storage_offset * itemsize);
     shape_ = shape;
     stride_ = stride;
     contiguous_ = compute_is_contiguous();
   }
-  Tensor(void *ptr, TensorShape shape, DType dtype, int device = -1)
+  Tensor(void *ptr, TensorShape shape, DType dtype, int device = -1,
+         int storage_offset = 0)
       : dtype_(dtype) {
     // TV_ASSERT_INVALID_ARG(!shape.empty(), "dont support empty shape");
+    auto itemsize = detail::sizeof_dtype(dtype);
     storage_ = std::make_shared<detail::TensorStorage<uint8_t>>(
-        reinterpret_cast<uint8_t *>(ptr),
-        shape.size() * detail::sizeof_dtype(dtype), device);
+        reinterpret_cast<uint8_t *>(ptr), shape.size() * itemsize, device,
+        storage_offset * itemsize);
     shape_ = shape;
     stride_ = shape.stride_rowmajor();
     contiguous_ = compute_is_contiguous();
   }
 
   Tensor(const void *ptr, TensorShape shape, TensorShape stride, DType dtype,
-         int device = -1)
+         int device = -1, int storage_offset = 0)
       : dtype_(dtype), writeable_(false) {
     // TV_ASSERT_INVALID_ARG(!shape.empty(), "dont support empty shape");
+    auto itemsize = detail::sizeof_dtype(dtype);
     storage_ = std::make_shared<detail::TensorStorage<uint8_t>>(
         reinterpret_cast<uint8_t *>(const_cast<void *>(ptr)),
-        shape.size() * detail::sizeof_dtype(dtype), device);
+        shape.size() * itemsize, device, storage_offset * itemsize);
     shape_ = shape;
     stride_ = stride;
     contiguous_ = compute_is_contiguous();
   }
-  Tensor(const void *ptr, TensorShape shape, DType dtype, int device = -1)
+  Tensor(const void *ptr, TensorShape shape, DType dtype, int device = -1,
+         int storage_offset = 0)
       : dtype_(dtype), writeable_(false) {
     // TV_ASSERT_INVALID_ARG(!shape.empty(), "dont support empty shape");
+    auto itemsize = detail::sizeof_dtype(dtype);
     storage_ = std::make_shared<detail::TensorStorage<uint8_t>>(
         reinterpret_cast<uint8_t *>(const_cast<void *>(ptr)),
-        shape.size() * detail::sizeof_dtype(dtype), device);
+        shape.size() * itemsize, device, storage_offset * itemsize);
     shape_ = shape;
     stride_ = shape.stride_rowmajor();
     contiguous_ = compute_is_contiguous();
@@ -683,10 +964,12 @@ struct Tensor {
 
   template <typename T, int Rank = -1,
             template <class> class PtrTraits = DefaultPtrTraits,
-            typename Tindex = TV_GLOBAL_INDEX>
+            typename Tindex = TV_GLOBAL_INDEX, bool DoTypeCheck = true>
   decltype(auto) tview() const {
     static_assert(Rank == -1 || Rank > 0, "error");
-    template_dtype_check<T>();
+    if (DoTypeCheck) {
+      template_dtype_check<T>();
+    }
     return if_constexpr<(Rank > 0)>(
         [&](auto _) {
           // detail::_if_constexpr_workaround<Rank, (Rank > 0)> _val;
@@ -699,7 +982,8 @@ struct Tensor {
           }
           return TensorView<const std::remove_const_t<T>, Rank, PtrTraits,
                             Tindex>(
-              reinterpret_cast<const std::remove_const_t<T> *>(this->data<T>()),
+              reinterpret_cast<const std::remove_const_t<T> *>(
+                  this->data<T, DoTypeCheck>()),
               _(shape), _(stride));
         },
         [&](auto _) {
@@ -711,17 +995,20 @@ struct Tensor {
           }
           return TensorView<const std::remove_const_t<T>, Rank, PtrTraits,
                             Tindex>(
-              reinterpret_cast<const std::remove_const_t<T> *>(this->data<T>()),
+              reinterpret_cast<const std::remove_const_t<T> *>(
+                  this->data<T, DoTypeCheck>()),
               _(shape), _(stride));
         });
   }
 
   template <typename T, int Rank = -1,
             template <class> class PtrTraits = DefaultPtrTraits,
-            typename Tindex = TV_GLOBAL_INDEX>
+            typename Tindex = TV_GLOBAL_INDEX, bool DoTypeCheck = true>
   decltype(auto) tview() {
     static_assert(Rank == -1 || Rank > 0, "error");
-    template_dtype_check<T>();
+    if (DoTypeCheck) {
+      template_dtype_check<T>();
+    }
     return if_constexpr<(Rank > 0)>(
         [&](auto _) {
           // detail::_if_constexpr_workaround<Rank, (Rank > 0)> _val;
@@ -733,7 +1020,8 @@ struct Tensor {
             stride[i] = stride_[i];
           }
           return TensorView<T, Rank, PtrTraits, Tindex>(
-              reinterpret_cast<T *>(this->data<T>()), _(shape), _(stride));
+              reinterpret_cast<T *>(this->data<T, DoTypeCheck>()), _(shape),
+              _(stride));
         },
         [&](auto _) {
           ShapeBase<TV_MAX_DIM, Tindex> shape(this->ndim()),
@@ -743,7 +1031,8 @@ struct Tensor {
             stride[i] = stride_[i];
           }
           return TensorView<T, Rank, PtrTraits, Tindex>(
-              reinterpret_cast<T *>(this->data<T>()), _(shape), _(stride));
+              reinterpret_cast<T *>(this->data<T, DoTypeCheck>()), _(shape),
+              _(stride));
         });
   }
 
@@ -985,6 +1274,9 @@ public:
     return as_strided(new_shape, new_stride, offset_);
   }
 
+  auto storage() const { return storage_; }
+  auto storage() { return storage_; }
+
   Tensor slice(int dim, TV_GLOBAL_INDEX start, TV_GLOBAL_INDEX end,
                TV_GLOBAL_INDEX step, bool start_is_none,
                bool end_is_none) const {
@@ -1041,14 +1333,16 @@ public:
 
   bool is_contiguous() const { return contiguous_; }
 
-  bool empty() const { return !storage_ || storage_->empty() || shape().empty(); }
+  bool empty() const {
+    return !storage_ || storage_->empty() || shape().empty();
+  }
   DType dtype() const { return dtype_; }
-  int device() const { return storage_ ? storage_->device(): -1; }
+  int device() const { return storage_ ? storage_->device() : -1; }
   size_t ndim() const { return shape_.ndim(); }
 
   const TensorShape &shape() const { return shape_; }
-  const std::vector<int64_t> shape_vector() const { 
-    return std::vector<int64_t>(shape_.begin(), shape_.end()); 
+  const std::vector<int64_t> shape_vector() const {
+    return std::vector<int64_t>(shape_.begin(), shape_.end());
   }
 
   const TensorShape &strides() const { return stride_; }
@@ -1090,6 +1384,7 @@ public:
   size_t byte_offset() const { return offset_; }
   bool is_cpu() const { return storage_ ? storage_->is_cpu() : true; }
   bool is_readonly() const { return !writeable_; }
+  std::uintptr_t gpu_address() const { return storage()->gpu_address(); }
   Tensor get_readonly() const {
     // used for cumm inliner, we can capture const tensor
     // as const ptr
@@ -1113,7 +1408,7 @@ public:
     if (empty()) {
       return nullptr;
     }
-    if (writeable_check){
+    if (writeable_check) {
       writable_check();
     }
     return storage_->data() + byte_offset();
@@ -1126,10 +1421,14 @@ public:
   }
   template <typename T> Tensor &fill_template_(T val, Context ctx) {
     writable_check();
-    if (this->device() == -1) {
+    auto target_device = this->device();
+    // #ifdef TV_HARDWARE_ACC_METAL
+    //     target_device = -1;
+    // #endif
+    if (target_device == -1) {
       std::fill(this->data_ptr<T>(), this->data_ptr<T>() + this->size(), val);
     } else {
-#if defined(TV_CUDA) && (TV_USE_CUDA_DRIVER)
+#if defined(TV_HARDWARE_ACC_CUDA) && (TV_USE_CUDA_DRIVER)
       auto tview = this->tview<T, -1, tv::DefaultPtrTraits, int64_t>();
       if (ctx.has_cuda_stream()) {
         tv::FillDev<T, -1, tv::DefaultPtrTraits, int64_t>::run_async(
@@ -1147,7 +1446,7 @@ public:
     if (device == -1) {
       return cpu(ctx);
     } else {
-#ifdef TV_CUDA
+#if defined(TV_ENABLE_HARDWARE_ACC)
       return cuda(ctx);
 #else
       TV_THROW_INVALID_ARG("don't compiled with cuda");
@@ -1158,12 +1457,16 @@ public:
     return fill_template_<T>(val, Context());
   }
 
-  Tensor &fill_(int val, Context ctx = Context()) {
+  Tensor &fill_(int64_t val, Context ctx = Context()) {
+    auto target_device = this->device();
+    // #ifdef TV_HARDWARE_ACC_METAL
+    //     target_device = -1;
+    // #endif
     using int_types_t =
         std::tuple<int32_t, int16_t, int8_t, uint32_t, uint16_t, uint8_t>;
     using int_types_cpu_t = std::tuple<uint64_t, int64_t, int32_t, int16_t,
                                        int8_t, uint32_t, uint16_t, uint8_t>;
-    if (device() == -1) {
+    if (target_device == -1) {
       Dispatch<int_types_cpu_t>()(dtype_, [&](auto I) -> void {
         using T = TV_DECLTYPE(I);
         fill_template_<T>(val, ctx);
@@ -1186,22 +1489,26 @@ public:
     return *this;
   }
 
-  template <typename T> T *data() {
+  template <typename T, bool DoTypeCheck = true> T *data() {
     if (empty()) {
       return nullptr;
     }
-    template_dtype_check<T>();
-    if (!std::is_const<T>::value){
+    if (DoTypeCheck) {
+      template_dtype_check<T>();
+    }
+    if (!std::is_const<T>::value) {
       writable_check();
     }
     return reinterpret_cast<T *>(raw_data(false));
   }
 
-  template <typename T> const T *data() const {
+  template <typename T, bool DoTypeCheck = true> const T *data() const {
     if (empty()) {
       return nullptr;
     }
-    template_dtype_check<T>();
+    if (DoTypeCheck) {
+      template_dtype_check<T>();
+    }
     return reinterpret_cast<const T *>(raw_data());
   }
 
@@ -1214,7 +1521,7 @@ public:
   const void *data_ptr() const {
     return reinterpret_cast<const void *>(raw_data());
   }
-  bool managed() const { return storage_ ? storage_->managed(): false; }
+  bool managed() const { return storage_ ? storage_->managed() : false; }
   void copy_(const Tensor &tensor, Context ctx = Context()) {
     writable_check();
     TV_ASSERT_INVALID_ARG(contiguous_, "only support contiguous for now");
@@ -1222,63 +1529,113 @@ public:
     TV_ASSERT_RT_ERR(this->size() == tensor.size(), "must have same size");
     TV_ASSERT_RT_ERR(this->dtype() == tensor.dtype(), "must have same dtype",
                      dtype_str(this->dtype()), dtype_str(tensor.dtype()));
-    if (this->device() == -1 && tensor.device() == -1) {
-#ifdef TV_CUDA
-      // use memcpy instead to avoid cuda context init
-      if (this->pinned()) {
-        if (ctx.has_cuda_stream()) {
-          host2host(this->raw_data(), tensor.raw_data(),
-                    this->size() * detail::sizeof_dtype(dtype_),
-                    ctx.cuda_stream());
+    detail::TensorStorage<uint8_t>::copy(
+        *(tensor.storage_), tensor.byte_offset(), *(this->storage_),
+        this->byte_offset(), this->raw_size(), ctx);
+    // #ifdef TV_HARDWARE_ACC_METAL
+    //     // use apple metal api to copy
+    //     bool sync_op = is_cpu(); // always sync if cpu to simulate cuda
+    //     behavior if (!ctx.has_item(ContextType::kAppleMetal)) {
+    //       ctx = Context().create_apple_metal_context();
+    //       sync_op = true;
+    //     }
+    //     auto *metal_ctx = reinterpret_cast<AppleMetalContext *>(
+    //                               ctx.get_item(ContextType::kAppleMetal));
+    //     auto cb = metal_ctx->commandBuffer();
+    //     TV_ASSERT_RT_ERR(cb, "error");
+    //     auto bce = detail::make_apple_mtl_ptr(cb->blitCommandEncoder());
+    //     TV_ASSERT_RT_ERR(bce, "error");
 
-        } else {
-          host2host(this->raw_data(), tensor.raw_data(),
-                    this->size() * detail::sizeof_dtype(dtype_));
-        }
-      } else {
-        std::copy(tensor.raw_data(),
-                  tensor.raw_data() + size() * detail::sizeof_dtype(dtype_),
-                  raw_data());
-      }
-#else
-      std::copy(tensor.raw_data(),
-                tensor.raw_data() + size() * detail::sizeof_dtype(dtype_),
-                raw_data());
-#endif
-    }
-#ifdef TV_CUDA
-    else if (device() >= 0 && tensor.device() == -1) {
-      if (ctx.has_cuda_stream()) {
-        host2dev(raw_data(), tensor.raw_data(),
-                 size() * detail::sizeof_dtype(dtype_), ctx.cuda_stream());
+    //     auto src = tensor.storage_->apple_metal_buffer_ptr();
+    //     auto dst = storage_->apple_metal_buffer_ptr();
+    //     auto src_offset = tensor.byte_offset() +
+    //     tensor.storage_->byte_offset(); auto dst_offset = byte_offset() +
+    //     storage_->byte_offset(); auto size = raw_size();
+    //     bce->copyFromBuffer(src, src_offset, dst, dst_offset, size);
+    //     bce->endEncoding();
 
-      } else {
-        host2dev(raw_data(), tensor.raw_data(),
-                 size() * detail::sizeof_dtype(dtype_));
-      }
+    //     if (sync_op) {
+    //       metal_ctx->synchronize(AppleMetalContext::SyncType::COMMIT_AND_WAIT);
+    //     }else{
+    //       metal_ctx->synchronize(AppleMetalContext::SyncType::COMMIT);
+    //     }
+    //     return;
+    // #else
 
-    } else if (device() == -1 && tensor.device() >= 0) {
-      if (ctx.has_cuda_stream()) {
-        dev2host(raw_data(), tensor.raw_data(),
-                 size() * detail::sizeof_dtype(dtype_), ctx.cuda_stream());
+    //     if (this->device() == -1 && tensor.device() == -1) {
+    // #if defined(TV_HARDWARE_ACC_CUDA)
+    //       // use memcpy instead to avoid cuda context init
+    //       if (this->pinned()) {
+    //         if (ctx.has_cuda_stream()) {
+    //           host2host(this->raw_data(), tensor.raw_data(),
+    //                     this->size() * detail::sizeof_dtype(dtype_),
+    //                     ctx.cuda_stream());
 
-      } else {
-        dev2host(raw_data(), tensor.raw_data(),
-                 size() * detail::sizeof_dtype(dtype_));
-      }
-    } else if (device() >= 0 && tensor.device() >= 0) {
-      if (ctx.has_cuda_stream()) {
-        dev2dev(raw_data(), tensor.raw_data(),
-                size() * detail::sizeof_dtype(dtype_), ctx.cuda_stream());
-      } else {
-        dev2dev(raw_data(), tensor.raw_data(),
-                size() * detail::sizeof_dtype(dtype_));
-      }
-    }
-#endif
-    else {
-      TV_THROW_RT_ERR("only support cpu tensor");
-    }
+    //         } else {
+    //           host2host(this->raw_data(), tensor.raw_data(),
+    //                     this->size() * detail::sizeof_dtype(dtype_));
+    //         }
+    //       } else {
+    //         std::copy(tensor.raw_data(),
+    //                   tensor.raw_data() + size() *
+    //                   detail::sizeof_dtype(dtype_), raw_data());
+    //       }
+    // #else
+    //       std::copy(tensor.raw_data(),
+    //                 tensor.raw_data() + size() *
+    //                 detail::sizeof_dtype(dtype_), raw_data());
+    // #endif
+    //     }
+    // #if defined(TV_HARDWARE_ACC_CUDA)
+    //     else if (device() >= 0 && tensor.device() == -1) {
+    //       if (ctx.has_cuda_stream()) {
+    //         host2dev(raw_data(), tensor.raw_data(),
+    //                  size() * detail::sizeof_dtype(dtype_),
+    //                  ctx.cuda_stream());
+
+    //       } else {
+    //         host2dev(raw_data(), tensor.raw_data(),
+    //                  size() * detail::sizeof_dtype(dtype_));
+    //       }
+
+    //     } else if (device() == -1 && tensor.device() >= 0) {
+    //       if (ctx.has_cuda_stream()) {
+    //         dev2host(raw_data(), tensor.raw_data(),
+    //                  size() * detail::sizeof_dtype(dtype_),
+    //                  ctx.cuda_stream());
+
+    //       } else {
+    //         dev2host(raw_data(), tensor.raw_data(),
+    //                  size() * detail::sizeof_dtype(dtype_));
+    //       }
+    //     } else if (device() >= 0 && tensor.device() >= 0) {
+    //       if (ctx.has_cuda_stream()) {
+    //         dev2dev(raw_data(), tensor.raw_data(),
+    //                 size() * detail::sizeof_dtype(dtype_),
+    //                 ctx.cuda_stream());
+    //       } else {
+    //         dev2dev(raw_data(), tensor.raw_data(),
+    //                 size() * detail::sizeof_dtype(dtype_));
+    //       }
+    //     }
+    // #endif
+    //     else {
+    //       TV_THROW_RT_ERR("only support cpu tensor");
+    //     }
+    // #endif
+  }
+
+  void copy_storage_(const Tensor &tensor, Context ctx = Context()) {
+    writable_check();
+    TV_ASSERT_RT_ERR(!this->empty() && !tensor.empty(), "must not empty");
+    TV_ASSERT_RT_ERR(this->storage_->size() == tensor.storage_->size(),
+                     "storage must have same size", this->shape(),
+                     tensor.shape(), this->storage_->size(),
+                     tensor.storage_->size());
+
+    detail::TensorStorage<uint8_t>::copy(*(tensor.storage_), 0,
+                                         *(this->storage_), 0,
+                                         this->storage_->size(), ctx);
   }
 
   void copy_2d_pitched_(const Tensor &tensor, Context ctx = Context()) {
@@ -1286,51 +1643,62 @@ public:
     TV_ASSERT_RT_ERR(!this->empty() && !tensor.empty(), "must not empty");
     TV_ASSERT_RT_ERR(this->dtype() == tensor.dtype(), "must have same dtype",
                      dtype_str(this->dtype()), dtype_str(tensor.dtype()));
-    TV_ASSERT_RT_ERR(this->ndim() == 2 && tensor.ndim() == 2, "must be 2d tensor");
-    TV_ASSERT_RT_ERR(this->stride(1) == 1 && tensor.stride(1) == 1, "stride[1] must be 1");
+    TV_ASSERT_RT_ERR(this->ndim() == 2 && tensor.ndim() == 2,
+                     "must be 2d tensor");
+    TV_ASSERT_RT_ERR(this->stride(1) == 1 && tensor.stride(1) == 1,
+                     "stride[1] must be 1");
     auto w = this->dim(1) * detail::sizeof_dtype(dtype_);
     auto h = this->dim(0);
     auto sw = tensor.dim(1) * detail::sizeof_dtype(dtype_);
     auto sh = tensor.dim(0);
     TV_ASSERT_RT_ERR(w == sw && h == sh, "shape must be same");
-    if (this->contiguous_ && tensor.contiguous_){
+    if (this->contiguous_ && tensor.contiguous_) {
       return copy_(tensor, ctx);
     }
+#ifdef TV_HARDWARE_ACC_METAL
+    TV_THROW_INVALID_ARG(
+        "copy 2d non-contiguous array not implemented for apple metal");
+#endif
+
     auto dst = this->raw_data();
     auto src = tensor.const_raw_data();
     auto dst_pitch = this->stride(0) * detail::sizeof_dtype(dtype_);
     auto src_pitch = tensor.stride(0) * detail::sizeof_dtype(dtype_);
     if (this->device() == -1 && tensor.device() == -1) {
-#ifdef TV_CUDA
-      checkCudaErrors(cudaMemcpy2D(dst, dst_pitch, src, src_pitch, w, h, cudaMemcpyHostToHost));
+#if defined(TV_HARDWARE_ACC_CUDA)
+      checkCudaErrors(cudaMemcpy2D(dst, dst_pitch, src, src_pitch, w, h,
+                                   cudaMemcpyHostToHost));
 #else
       TV_THROW_INVALID_ARG("not implemented for cpu tensor")
 #endif
     }
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
     else if (device() >= 0 && tensor.device() == -1) {
       if (ctx.has_cuda_stream()) {
-        checkCudaErrors(cudaMemcpy2DAsync(dst, dst_pitch, src, src_pitch, 
-          w, h, cudaMemcpyHostToDevice, ctx.cuda_stream()));
+        checkCudaErrors(cudaMemcpy2DAsync(dst, dst_pitch, src, src_pitch, w, h,
+                                          cudaMemcpyHostToDevice,
+                                          ctx.cuda_stream()));
       } else {
-        checkCudaErrors(cudaMemcpy2D(dst, dst_pitch, src, src_pitch, 
-          w, h, cudaMemcpyHostToDevice));
+        checkCudaErrors(cudaMemcpy2D(dst, dst_pitch, src, src_pitch, w, h,
+                                     cudaMemcpyHostToDevice));
       }
     } else if (device() == -1 && tensor.device() >= 0) {
       if (ctx.has_cuda_stream()) {
-        checkCudaErrors(cudaMemcpy2DAsync(dst, dst_pitch, src, src_pitch, 
-          w, h, cudaMemcpyDeviceToHost, ctx.cuda_stream()));
+        checkCudaErrors(cudaMemcpy2DAsync(dst, dst_pitch, src, src_pitch, w, h,
+                                          cudaMemcpyDeviceToHost,
+                                          ctx.cuda_stream()));
       } else {
-        checkCudaErrors(cudaMemcpy2D(dst, dst_pitch, src, src_pitch, 
-          w, h, cudaMemcpyDeviceToHost));
+        checkCudaErrors(cudaMemcpy2D(dst, dst_pitch, src, src_pitch, w, h,
+                                     cudaMemcpyDeviceToHost));
       }
     } else if (device() >= 0 && tensor.device() >= 0) {
       if (ctx.has_cuda_stream()) {
-        checkCudaErrors(cudaMemcpy2DAsync(dst, dst_pitch, src, src_pitch, 
-          w, h, cudaMemcpyDeviceToDevice, ctx.cuda_stream()));
+        checkCudaErrors(cudaMemcpy2DAsync(dst, dst_pitch, src, src_pitch, w, h,
+                                          cudaMemcpyDeviceToDevice,
+                                          ctx.cuda_stream()));
       } else {
-        checkCudaErrors(cudaMemcpy2D(dst, dst_pitch, src, src_pitch, 
-          w, h, cudaMemcpyDeviceToDevice));
+        checkCudaErrors(cudaMemcpy2D(dst, dst_pitch, src, src_pitch, w, h,
+                                     cudaMemcpyDeviceToDevice));
       }
     }
 #endif
@@ -1358,21 +1726,33 @@ public:
   }
 
   Tensor cpu(Context ctx = Context()) const {
-    if (empty()){
+    if (empty()) {
       return Tensor();
     }
     if (storage_->device() == -1) {
       // cpu() should always copy tensor.
-      return clone();
+      return clone(false, false, ctx);
     }
-    Tensor res(shape_, stride_, dtype_, -1, storage_->managed());
-    res.copy_(*this);
+    Tensor res;
+    if (shape_.ndim() == 2 && this->stride(1) == 1) {
+      res = Tensor(shape_, dtype_, -1, storage_->managed());
+      res.copy_2d_pitched_(*this, ctx);
+    } else {
+      if (!contiguous_) {
+        void *ptr = nullptr;
+        res = Tensor(ptr, shape_, stride_, dtype_, -1);
+        res.storage_ = storage_->cpu(ctx);
+      } else {
+        res = Tensor(shape_, stride_, dtype_, -1, storage_->managed());
+        res.copy_(*this, ctx);
+      }
+    }
     return res;
   }
 
-#ifdef TV_CUDA
+#if defined(TV_ENABLE_HARDWARE_ACC)
   Tensor cuda(Context ctx = Context()) const {
-    if (empty()){
+    if (empty()) {
       return Tensor();
     }
     if (storage_->device() >= 0) {
@@ -1461,7 +1841,8 @@ public:
     return ten;
   }
 
-  Tensor clone(bool pinned = false, bool use_cpu_copy = false) const {
+  Tensor clone(bool pinned = false, bool use_cpu_copy = false,
+               Context ctx = Context()) const {
     if (empty()) {
       return Tensor();
     }
@@ -1473,30 +1854,30 @@ public:
         TV_ASSERT_INVALID_ARG(device() == -1, "tensor must be cpu");
         newtensor.copy_cpu_(*this);
       } else {
-        newtensor.copy_(*this);
+        newtensor.copy_(*this, ctx);
       }
     }
     return newtensor;
   }
 
-  Tensor clone_whole_storage() const {
+  Tensor clone_whole_storage(Context ctx = Context()) const {
     // this method clone whole storage,
     // so it can be used with non-contiguous tensor.
     if (empty()) {
       return Tensor();
     }
     Tensor res = *this;
-    res.storage_ = storage_->clone();
+    res.storage_ = storage_->clone(ctx);
     return res;
   }
 
-  void zero_whole_storage_() const {
+  void zero_whole_storage_(Context ctx = Context()) const {
     // this method zero whole storage,
     // so it can be used with non-contiguous tensor.
     if (empty()) {
       return;
     }
-    storage_->zero_whole_();
+    storage_->zero_whole_(ctx);
   }
 
   Tensor rand_(int seed = -1) {
@@ -1514,7 +1895,7 @@ public:
           tensor_tv[i] = distr(generator);
         }
       } else {
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
         curandGenerator_t gen;
         auto status = curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
         if (status != CURAND_STATUS_SUCCESS) {
@@ -1618,7 +1999,7 @@ public:
         //                         type_s<std::decay_t<Tcur>>, "to",
         //                         type_s<std::decay_t<Tdst>>);
         // }
-        if_constexpr<std::is_convertible<Tcur, Tdst>::value>(
+        if_constexpr<detail::is_convertible<Tcur, Tdst>::value>(
             [&](auto _) {
               auto ptr = this->data<Tcur>();
               tensor =
@@ -1635,9 +2016,8 @@ public:
     });
     return tensor;
   }
-  bool writeable() const {
-    return writeable_;
-  }
+  bool writeable() const { return writeable_; }
+
 protected:
   inline void writable_check() {
     TV_ASSERT_RT_ERR(writeable_,
@@ -1676,7 +2056,7 @@ template <typename Os> Os &operator<<(Os &os, const Tensor &tensor) {
     if (std::is_same<T, float>::value || std::is_same<T, double>::value) {
       ss << std::setprecision(4);
     }
-#if defined(TV_CUDA) && CUDA_VERSION < 11000
+#if defined(TV_HARDWARE_ACC_CUDA) && CUDA_VERSION < 11000
     if_constexpr<std::is_same<T, __half>::value>(
         [&](auto _) {
           auto tensorf = tensor.astype(float32);
@@ -1688,7 +2068,7 @@ template <typename Os> Os &operator<<(Os &os, const Tensor &tensor) {
           auto tview = tensor.tview<const T, -1, DefaultPtrTraits, int64_t>();
           os << tview.repr(ss);
         });
-#elif defined(TV_CUDA) && CUDA_VERSION >= 11000
+#elif defined(TV_HARDWARE_ACC_CUDA) && CUDA_VERSION >= 11000
     if_constexpr<std::is_same<T, __half>::value || std::is_same<T, __nv_bfloat16>::value>([&](auto _){
       auto tensorf = tensor.astype(float32);
       auto tview = tensorf.tview<const float, -1, DefaultPtrTraits, int64_t>();
@@ -1697,7 +2077,7 @@ template <typename Os> Os &operator<<(Os &os, const Tensor &tensor) {
       auto tview = tensor.tview<const T, -1, DefaultPtrTraits, int64_t>();
       os << tview.repr(ss);
     });
-#elif defined(TV_CUDA) && CUDA_VERSION >= 11080
+#elif defined(TV_HARDWARE_ACC_CUDA) && CUDA_VERSION >= 11080
     if_constexpr<std::is_same<T, __half>::value || std::is_same<T, __nv_bfloat16>::value || std::is_same<T, __nv_fp8_e5m2>::value || std::is_same<T, __nv_fp8_e4m3>::value>([&](auto _){
       auto tensorf = tensor.astype(float32);
       auto tview = tensorf.tview<const float, -1, DefaultPtrTraits, int64_t>();
@@ -1715,23 +2095,23 @@ template <typename Os> Os &operator<<(Os &os, const Tensor &tensor) {
 }
 
 inline Tensor from_blob(void *ptr, TensorShape shape, DType dtype,
-                        int device = -1) {
-  return Tensor(ptr, shape, dtype, device);
+                        int device = -1, int storage_offset = 0) {
+  return Tensor(ptr, shape, dtype, device, storage_offset);
 }
 
 inline Tensor from_blob(const void *ptr, TensorShape shape, DType dtype,
-                        int device = -1) {
-  return Tensor(ptr, shape, dtype, device);
+                        int device = -1, int storage_offset = 0) {
+  return Tensor(ptr, shape, dtype, device, storage_offset);
 }
 
 inline Tensor from_blob(void *ptr, TensorShape shape, TensorShape stride,
-                        DType dtype, int device = -1) {
-  return Tensor(ptr, shape, stride, dtype, device);
+                        DType dtype, int device = -1, int storage_offset = 0) {
+  return Tensor(ptr, shape, stride, dtype, device, storage_offset);
 }
 
 inline Tensor from_blob(const void *ptr, TensorShape shape, TensorShape stride,
-                        DType dtype, int device = -1) {
-  return Tensor(ptr, shape, stride, dtype, device);
+                        DType dtype, int device = -1, int storage_offset = 0) {
+  return Tensor(ptr, shape, stride, dtype, device, storage_offset);
 }
 
 inline Tensor empty(TensorShape shape, DType dtype, int device = -1,
@@ -1745,16 +2125,18 @@ inline Tensor zeros(TensorShape shape, DType dtype, int device = -1,
 }
 
 template <typename T>
-std::tuple<Tensor, T*> empty_with_ptr(TensorShape shape, int device = -1,
-                    bool pinned = false, bool managed = false) {
+std::tuple<Tensor, T *> empty_with_ptr(TensorShape shape, int device = -1,
+                                       bool pinned = false,
+                                       bool managed = false) {
   auto res = Tensor(shape, type_v<T>, device, pinned, managed);
   auto res_ptr = res.data_ptr<T>();
   return std::make_tuple(res, res_ptr);
 }
 
 template <typename T>
-std::tuple<Tensor, T*> zeros_with_ptr(TensorShape shape, int device = -1,
-                    bool pinned = false, bool managed = false) {
+std::tuple<Tensor, T *> zeros_with_ptr(TensorShape shape, int device = -1,
+                                       bool pinned = false,
+                                       bool managed = false) {
   auto res = Tensor(shape, type_v<T>, device, pinned, managed).zero_();
   auto res_ptr = res.data_ptr<T>();
   return std::make_tuple(res, res_ptr);
@@ -1764,7 +2146,7 @@ inline Tensor zeros_managed(TensorShape shape, DType dtype) {
   return Tensor(shape, dtype, 0, true, true).zero_();
 }
 
-inline Tensor full(TensorShape shape, int val, DType dtype, int device = -1,
+inline Tensor full(TensorShape shape, int64_t val, DType dtype, int device = -1,
                    bool pinned = false, bool managed = false) {
   return Tensor(shape, dtype, device, pinned, managed).fill_(val);
 }

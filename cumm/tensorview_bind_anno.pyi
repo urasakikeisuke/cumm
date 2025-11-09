@@ -1,4 +1,4 @@
-# Copyright 2021 Yan Yan
+# Copyright 2024 Yan Yan
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,6 +33,18 @@ class Context:
 
     def set_cuda_stream(self, stream: int) -> "Context":
         ... 
+
+    def create_apple_metal_context(self) -> None:
+        ...
+
+    def create_or_update_metal_context_from_blob(self, command_buffer_ptr: int, dispatch_queue_ptr: int) -> None:
+        ...
+
+    def has_apple_metal_context(self) -> bool:
+        ...
+
+    def synchronize(self) -> None:
+        ...
 
 class CUDAEvent:
     def __init__(self, name: str = "") -> None:
@@ -149,7 +161,10 @@ class NVRTCProgram:
 class NVRTCModule:
     kTensor = 0
     kArray = 1
-    kScalar = 2
+    kTensorView = 2
+    kScalar = 3
+    kConstant = 4
+    kDevicePointer = 5
 
     @overload
     def __init__(self,
@@ -170,7 +185,7 @@ class NVRTCModule:
 
     def run_kernel(self, name: str, blocks: List[int], threads: List[int],
                    smem_size: int, stream: int, args: List[Tuple[Tensor,
-                                                                 int]]):
+                                                                 int, int, int]]):
         ...
 
     @property
@@ -181,6 +196,21 @@ class NVRTCModule:
         ...
 
     def get_kernel_attributes(self, name: str) -> Dict[str, int]:
+        ...
+
+class MetalModule:
+    @overload
+    def __init__(self, binary: "Tensor"):
+        ...
+
+    @overload
+    def __init__(self, code: str, preprocessorMacros: Dict[str, str], fastMathEnabled: bool = True):
+        ...
+
+    def run_kernel(self, name: str, blocks: List[int], threads: List[int],
+                   smem_size: int, ctx: Context, args: List[Tuple[Tensor,
+                                                                 int, int, int]],
+                    use_nonuniform_threadgroup: bool = True):
         ...
 
 
@@ -344,6 +374,14 @@ class Tensor:
         ...
 
     @overload
+    def copy_storage_(self, other: "Tensor") -> None:
+        ...
+
+    @overload
+    def copy_storage_(self, other: "Tensor", ctx: Context) -> None:
+        ...
+
+    @overload
     def zero_(self) -> "Tensor":
         ...
 
@@ -385,6 +423,10 @@ class Tensor:
 
     def byte_pointer(self) -> int:
         ...
+        
+    def gpu_address(self) -> int:
+        ...
+
 
 
 def zeros(shape: List[int],
@@ -400,7 +442,8 @@ def from_blob(ptr: int,
               shape: List[int],
               stride: List[int],
               dtype: int,
-              device: int = -1) -> Tensor:
+              device: int,
+              storage_offset: int = 0) -> Tensor:
     ...
 
 
@@ -409,7 +452,8 @@ def from_const_blob(ptr: int,
                     shape: List[int],
                     stride: List[int],
                     dtype: int,
-                    device: int = -1) -> Tensor:
+                    device: int,
+                    storage_offset: int = 0) -> Tensor:
     ...
 
 
@@ -417,7 +461,8 @@ def from_const_blob(ptr: int,
 def from_blob(ptr: int,
               shape: List[int],
               dtype: int,
-              device: int = -1) -> Tensor:
+              device: int,
+              storage_offset: int = 0) -> Tensor:
     ...
 
 
@@ -425,7 +470,8 @@ def from_blob(ptr: int,
 def from_const_blob(ptr: int,
                     shape: List[int],
                     dtype: int,
-                    device: int = -1) -> Tensor:
+                    device: int,
+                    storage_offset: int = 0) -> Tensor:
     ...
 
 

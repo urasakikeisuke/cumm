@@ -1,4 +1,4 @@
-// Copyright 2021 Yan Yan
+// Copyright 2024 Yan Yan
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,8 +13,9 @@
 // limitations under the License.
 
 #pragma once
+#include <tensorview/core/defs.h>
 
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
 #include <cuda_runtime_api.h>
 #endif
 #include <chrono>
@@ -141,7 +142,7 @@ public:
 
 };
 
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
 
 class CUDAEventCore {
 private:
@@ -428,7 +429,7 @@ public:
     }
   }
 
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
   CUDAKernelTimerGuard(std::string name, CUDAKernelTimer timer,
                        cudaStream_t stream = nullptr, bool print_exit = false): CUDAKernelTimerGuard(name, timer, reinterpret_cast<std::uintptr_t>(stream), print_exit){}
 #endif
@@ -448,7 +449,7 @@ public:
   }
 };
 
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
 inline auto measure_and_print_guard(std::string name, cudaStream_t stream = nullptr){
   return std::make_shared<CUDAKernelTimerGuard>(name, CUDAKernelTimer(true), stream, true);
 };

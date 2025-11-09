@@ -1,4 +1,4 @@
-// Copyright 2021 Yan Yan
+// Copyright 2024 Yan Yan
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@
 
 #include <unordered_map>
 #include <vector>
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
 #include <cuda.h>
 #include <nvrtc.h>
 #include <tensorview/cuda/driver.h>
@@ -68,7 +68,7 @@ public:
       header_ptr = header_buffers.data();
       header_name_ptr = header_names.data();
     }
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
     TV_NVRTC_SAFE_CALL(nvrtcCreateProgram(&prog_,                // prog
                                           code_.c_str(),         // buffer
                                           program_name_.c_str(), // name
@@ -88,12 +88,12 @@ public:
     TV_NVRTC_SAFE_CALL(nvrtcGetProgramLogSize(prog_, &logSize));
     std::string log(logSize, '0');
     auto nvrtc_compile_res = nvrtcGetProgramLog(prog_, &log[0]);
-    if (compileResult != NVRTC_SUCCESS) {
-      tv::ssprint(log);
-    }
+    // if (compileResult != NVRTC_SUCCESS) {
+    //   tv::ssprint(log);
+    // }
     TV_NVRTC_SAFE_CALL(nvrtc_compile_res);
     compile_log_ = log;
-    TV_ASSERT_RT_ERR(compileResult == NVRTC_SUCCESS, "nvrtc compile failed.");
+    TV_ASSERT_RT_ERR(compileResult == NVRTC_SUCCESS, "nvrtc compile failed. log: \n", log);
     // post check
     predefined_name_expr_map_.clear();
     for (size_t i = 0; i < name_exprs_.size(); ++i) {
@@ -206,7 +206,7 @@ public:
   }
 
   ~NVRTCProgram() {
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
     if (prog_) {
       nvrtcDestroyProgram(&prog_);
     }
@@ -217,7 +217,7 @@ public:
     if (!ptx_.empty()){
       return ptx_;
     }
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
     if (prog_ == nullptr) {
       TV_ASSERT_RT_ERR(!ptx_.empty(), "PTX is empty!!!");
       return ptx_;
@@ -237,7 +237,7 @@ public:
     if (!cubin_.empty()){
       return cubin_;
     }
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
 #if (CUDA_VERSION < 11000)
     TV_THROW_RT_ERR("cubin not implemented for CUDA < 11");
 #else 
@@ -264,7 +264,7 @@ public:
   std::vector<std::string> name_exprs() const { return name_exprs_; }
 
   std::string get_lowered_name(std::string name) const {
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
     if (prog_ == nullptr) {
       TV_ASSERT_RT_ERR(predefined_name_expr_map_.find(name) !=
                            predefined_name_expr_map_.end(),
@@ -283,7 +283,7 @@ public:
   }
 
 private:
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
   nvrtcProgram prog_ = nullptr;
 #endif
   std::string code_;
@@ -301,13 +301,13 @@ private:
 
 class NVRTCModule {
 public:
-  enum ArgType { kTensor = 0, kArray = 1, kTensorView = 2 };
+  enum ArgType { kTensor = 0, kArray = 1, kTensorView = 2, kScalar = 3, kConstant = 4, kDevicePointer = 5 };
 
   NVRTCModule(std::shared_ptr<NVRTCProgram> program,
               std::string cudadevrt_path = "")
       : program_(program), module_(nullptr), cudadevrt_path_(cudadevrt_path) {
     TV_ASSERT_RT_ERR(program, "program ptr must not empty");
-#ifndef TV_CUDA
+#ifndef TV_HARDWARE_ACC_CUDA
     TV_THROW_RT_ERR("you must compile with CUDA first to use NVRTCModule");
 #endif
     ptx_name_ = program->program_name() + ".ptx";
@@ -330,7 +330,7 @@ public:
   }
 
   NVRTCModule &load() {
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
     if (module_ != nullptr) {
       TV_THROW_RT_ERR("this module is already compiled");
     }
@@ -362,7 +362,7 @@ public:
 #endif
     return *this;
   }
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
 
   CUfunction kernel(std::string name) {
 
@@ -375,7 +375,7 @@ public:
 #endif
   std::unordered_map<std::string, int> get_kernel_attributes(std::string name) {
     std::unordered_map<std::string, int> res;
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
     auto k = kernel(name);
     int pi;
     TV_CUDA_RESULT_CHECK(wrapper_.cuDrvFuncGetAttribute(
@@ -410,7 +410,7 @@ public:
   }
 
   void set_max_dynamic_shared_size_bytes(std::string name, int size) {
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
     auto k = kernel(name);
     TV_CUDA_RESULT_CHECK_V2(wrapper_.cuDrvFuncSetAttribute(
         k, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, size), 
@@ -419,7 +419,7 @@ public:
   }
 
   void set_preferred_smem_carveout(std::string name, int carveout) {
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
     TV_ASSERT_INVALID_ARG(carveout > 0 && carveout <= 100, "carveout must in (0, 100]")
     auto k = kernel(name);
     TV_CUDA_RESULT_CHECK_V2(wrapper_.cuDrvFuncSetAttribute(
@@ -438,19 +438,31 @@ public:
   void run_kernel(std::string name, std::array<int, 3> blocks,
                   std::array<int, 3> threads, int smem_size,
                   std::uintptr_t stream_int,
-                  std::vector<std::tuple<tv::Tensor, int>> args) {
-#ifdef TV_CUDA
+                  std::vector<std::tuple<tv::Tensor, int, std::uintptr_t, size_t>> args) {
+#if defined(TV_HARDWARE_ACC_CUDA)
     if (module_ == nullptr) {
       load();
     }
     CUstream stream = reinterpret_cast<CUstream>(stream_int);
     std::vector<void *> params;
     std::vector<const void *> tensor_ptrs(args.size());
+    std::vector<tv::Tensor> tensor_view_datas;
+
     int cnt = 0;
     for (auto &arg : args) {
       auto &ten = std::get<0>(arg);
       auto arg_type = std::get<1>(arg);
       switch (arg_type) {
+      case ArgType::kDevicePointer: {
+        if (std::get<2>(arg) != 0){
+          tensor_ptrs[cnt] = reinterpret_cast<const char *>(std::get<2>(arg)) + std::get<3>(arg);
+        }else{
+          tensor_ptrs[cnt] = nullptr;
+        }
+        params.push_back(&tensor_ptrs[cnt]);
+        cnt += 1;
+        break;
+      }
       case ArgType::kTensor: {
         if (ten.empty()) {
           tensor_ptrs[cnt] = nullptr;
@@ -462,10 +474,27 @@ public:
         cnt += 1;
         break;
       }
+      case ArgType::kScalar:
+      case ArgType::kConstant:
       case ArgType::kArray: {
         TV_ASSERT_INVALID_ARG(ten.device() == -1, "array tensor must be CPU");
+        // const check is performed in python
         params.push_back(const_cast<void *>(
             reinterpret_cast<const void *>(ten.const_raw_data())));
+        break;
+      }
+      case ArgType::kTensorView: {
+        TV_ASSERT_INVALID_ARG(ten.device() == 0 && ten.ndim() <= 10, "array tensor must be GPU and <= 10 dim");
+        tv::DispatchInt<tv::mp_list_int_range<1, 11>>()(ten.ndim(), [&](auto I){
+          constexpr auto V = int(I);
+          auto tview = ten.tview<const float, V, tv::DefaultPtrTraits, TV_GLOBAL_INDEX, false>();
+          using tview_t = std::decay_t<decltype(tview)>;
+          tv::Tensor storage = tv::empty({sizeof(tview_t)}, tv::uint8, tv::kDeviceCPU);
+          auto tview_data_ptr = reinterpret_cast<tview_t*>(storage.raw_data());
+          tview_data_ptr[0] = tview;
+          tensor_view_datas.push_back(storage);
+          params.push_back(storage.raw_data());
+        });
         break;
       }
       default:
@@ -486,7 +515,7 @@ public:
         threads[2], "Smem:", smem_size);
 #endif
   }
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
   const CUDADriverWrapper &get_driver_wrapper() { return wrapper_; }
 
   CUresult cuDrvLaunchKernel(CUfunction f, uint32_t gridDimX, uint32_t gridDimY,
@@ -510,7 +539,7 @@ public:
 #endif
 
   ~NVRTCModule() {
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
     if (module_ != nullptr) {
       wrapper_.cuDrvModuleUnload(module_);
     }
@@ -526,7 +555,7 @@ private:
   std::string cudadevrt_path_;
   std::string ptx_name_;
 
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
   CUmodule module_ = nullptr;
   CUDADriverWrapper wrapper_;
   CUlinkState linkState_ = nullptr;

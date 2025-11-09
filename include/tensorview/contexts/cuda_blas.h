@@ -1,4 +1,4 @@
-// Copyright 2021 Yan Yan
+// Copyright 2024 Yan Yan
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 #pragma once
 #include "core.h"
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
 #include <cublasLt.h>
 #endif
 
@@ -36,7 +36,7 @@ struct BlasContext : Context {
     context_ptr_->register_manager(ContextType::kCublasLt, cublaslt_mgr);
   }
 
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
   bool has_cublaslt_handle() {
     check_ptr_valid();
     return context_ptr_->has_item(ContextType::kCublasLt);

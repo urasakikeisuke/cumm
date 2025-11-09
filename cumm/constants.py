@@ -1,4 +1,4 @@
-# Copyright 2021 Yan Yan
+# Copyright 2024 Yan Yan
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import List
 
 from ccimport import compat
-
+import subprocess
 PACKAGE_NAME = "cumm"
 PACKAGE_ROOT = Path(__file__).parent.resolve()
 
@@ -36,7 +36,8 @@ assert TENSORVIEW_INCLUDE_PATH.exists()
 
 TENSORVIEW_INCLUDE_PATH = str(TENSORVIEW_INCLUDE_PATH)
 TENSORVIEW_INCLUDE_PATH = os.getenv("CUMM_INCLUDE_PATH", TENSORVIEW_INCLUDE_PATH)
-
+TENSORVIEW_LIBCUDACXX_PATH = PACKAGE_ROOT / "libcudacxx_include"
+TENSORVIEW_IS_CUDA_PREBUILT = TENSORVIEW_LIBCUDACXX_PATH.exists()
 CUTLASS_MODE = False
 CUTLASS_INPUT_ITER = CUTLASS_MODE and True
 CUTLASS_SMEM_WARP_ITER = CUTLASS_MODE and True
@@ -58,3 +59,5 @@ except ImportError:
     CUMM_DISABLE_JIT = os.getenv("CUMM_DISABLE_JIT", "0") == "1"
 
 CUMM_MAXIMUM_NVRTC_CONV_NDIM = 3
+
+CUMM_APPLE_METAL_CPP_ROOT = os.getenv("CUMM_APPLE_METAL_CPP_ROOT", None)

@@ -31,15 +31,16 @@ DESCRIPTION = 'CUda Matrix Multiply library'
 URL = 'https://github.com/FindDefinition/cumm'
 EMAIL = 'yanyan.sub@outlook.com'
 AUTHOR = 'Yan Yan'
-REQUIRES_PYTHON = '>=3.6'
+REQUIRES_PYTHON = '>=3.8'
 VERSION = None
 
 # What packages are required for this module to be executed?
 REQUIRED = [
-    "pccm>=0.4.2",
+    "pccm>=0.4.15",
     "pybind11>=2.6.0",
     "fire",
     "numpy",
+    "sympy",
     "contextvars; python_version == \"3.6\"",
 ]
 
@@ -154,15 +155,23 @@ class CopyHeaderCallback(ExtCallback):
         include_path = package_dir / "cumm" / "include"
         target_lib_path = package_dir / "cumm" / "lib"
         target_nvrtc_include_path = package_dir / "cumm" / "nvrtc_include"
+        libcudacxx_include_path = package_dir / "cumm" / "libcudacxx_include"
         if target_lib_path.exists():
             shutil.rmtree(target_lib_path)
         if target_nvrtc_include_path.exists():
             shutil.rmtree(target_nvrtc_include_path)
         if include_path.exists():
             shutil.rmtree(include_path)
+        if libcudacxx_include_path.exists():
+            shutil.rmtree(libcudacxx_include_path)
         root = Path(__file__).parent.resolve()
         code_path = root / "include"
+        cccl_path = root / "third_party" / "cccl"
         shutil.copytree(code_path, include_path)
+        if cccl_path.exists():
+            libcudacxx_include = cccl_path / "libcudacxx" / "include"
+            if libcudacxx_include.exists():
+                shutil.copytree(libcudacxx_include, libcudacxx_include_path)
         if compat.InLinux:
             # copy /usr/local/cuda/lib64/libcudadevrt.a
             cudadevrt = Path("/usr/local/cuda/lib64/libcudadevrt.a")
@@ -182,8 +191,8 @@ if disable_jit is not None and disable_jit == "1":
         'build_ext': PCCMBuild,
     }
     from cumm.csrc.arrayref import ArrayPtr
-    from cumm.tensorview_bind import TensorViewBind
-    cus = [ArrayPtr(), TensorViewBind()]
+    from cumm.tensorview_bind import TensorViewBind, AppleMetalImpl
+    cus = [ArrayPtr(), TensorViewBind(), AppleMetalImpl()]
 
     if cuda_ver is None or (cuda_ver is not None and cuda_ver != ""):
         pass
@@ -191,7 +200,8 @@ if disable_jit is not None and disable_jit == "1":
         PCCMExtension(cus,
                       "cumm/core_cc",
                       Path(__file__).resolve().parent / "cumm",
-                      extcallback=CopyHeaderCallback())
+                      extcallback=CopyHeaderCallback(),
+                      std="c++17" if compat.InMacOS else "c++14",)
     ]
 else:
     cmdclass = {

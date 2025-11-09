@@ -1,4 +1,4 @@
-// Copyright 2021 Yan Yan
+// Copyright 2024 Yan Yan
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,13 +15,16 @@
 #pragma once
 #include "hash_core.h"
 #include <tensorview/core/all.h>
+#ifdef __METAL_VERSION__ 
+#pragma METAL internals : enable
+
+#endif
 
 namespace tv {
 namespace hash {
 
 namespace detail {
 template <size_t Nbits> struct MortonCore;
-
 template <> struct MortonCore<32> {
   TV_HOST_DEVICE_INLINE static uint32_t split_by_3bits(uint32_t a) {
     uint32_t x = a & 0x000003ff; // we only look at the first 10 bits
@@ -67,7 +70,7 @@ template <> struct MortonCore<64> {
 template <typename T> struct Morton;
 
 template <> struct Morton<uint32_t> : public detail::MortonCore<32> {
-  static constexpr int kNumBits = 32;
+  static constexpr TV_METAL_CONSTANT int kNumBits = 32;
   TV_HOST_DEVICE_INLINE static uint32_t encode(uint32_t x, uint32_t y,
                                                uint32_t z) {
     return (split_by_3bits(z) << 2) | (split_by_3bits(y) << 1) |
@@ -83,7 +86,7 @@ template <> struct Morton<uint32_t> : public detail::MortonCore<32> {
 };
 
 // template <> struct Morton<int64_t> : public detail::MortonCore<64> {
-//   static constexpr int kNumBits = 64;
+//   static constexpr TV_METAL_CONSTANT int kNumBits = 64;
 //   TV_HOST_DEVICE_INLINE static uint64_t encode(int32_t x, int32_t y,
 //                                                int32_t z) {
 //     auto abs_x = x >= 0 ? x : -x;
@@ -117,7 +120,7 @@ template <> struct Morton<uint32_t> : public detail::MortonCore<32> {
 // };
 
 template <> struct Morton<uint64_t> : public detail::MortonCore<64> {
-  static constexpr int kNumBits = 64;
+  static constexpr TV_METAL_CONSTANT int kNumBits = 64;
   TV_HOST_DEVICE_INLINE static uint64_t encode(uint32_t x, uint32_t y,
                                                uint32_t z) {
     return (split_by_3bits(z) << 2) | (split_by_3bits(y) << 1) |
@@ -132,6 +135,24 @@ template <> struct Morton<uint64_t> : public detail::MortonCore<64> {
     return get_third_bits(d >> Axis);
   }
 };
+#ifndef TV_METAL_CC
+template <> struct Morton<std::conditional_t<std::is_same<uint64_t, unsigned long long>::value, detail::__place_holder_t, unsigned long long>> : public detail::MortonCore<64> {
+  static constexpr TV_METAL_CONSTANT int kNumBits = 64;
+  TV_HOST_DEVICE_INLINE static uint64_t encode(uint32_t x, uint32_t y,
+                                               uint32_t z) {
+    return (split_by_3bits(z) << 2) | (split_by_3bits(y) << 1) |
+           (split_by_3bits(x) << 0);
+  }
+
+  TV_HOST_DEVICE_INLINE static tv::array<uint32_t, 3> decode(uint64_t d) {
+    return {get_third_bits(d), get_third_bits(d >> 1), get_third_bits(d >> 2)};
+  }
+  template <uint32_t Axis>
+  TV_HOST_DEVICE_INLINE static uint32_t decode_axis(uint64_t d) {
+    return get_third_bits(d >> Axis);
+  }
+};
+#endif
 
 template <typename K> struct Murmur3Hash {
   using key_type = tv::hash::to_unsigned_t<K>;
@@ -144,8 +165,11 @@ template <typename K> struct Murmur3Hash {
     k ^= k >> 16;
     return k;
   }
-  TV_HOST_DEVICE_INLINE static key_type encode(key_type x) { return x; }
+  TV_HOST_DEVICE_INLINE static key_type encode(key_type x) { 
+    return detail::platform_not_support_atomic_64_metas<K>::map_user_key(x);
+  }
   TV_HOST_DEVICE_INLINE static key_type hash_scalar(key_type key) {
+    key = detail::platform_not_support_atomic_64_metas<K>::unmap_user_key(key);
     return hash(key);
   }
 };
@@ -162,11 +186,13 @@ template <typename K> struct SpatialHash {
   }
   TV_HOST_DEVICE_INLINE static key_type encode(uint32_t x, uint32_t y,
                                                uint32_t z) {
-    return Morton<K>::encode(x, y, z);
+    auto res = Morton<key_type>::encode(x, y, z);
+    return detail::platform_not_support_atomic_64_metas<K>::map_user_key(res);
   }
-  // this function hash a single number by decode and hash
+  // this function hash a single number by decode and hash from existed key
   TV_HOST_DEVICE_INLINE static key_type hash_scalar(key_type key) {
-    auto decoded = Morton<K>::decode(key);
+    key = detail::platform_not_support_atomic_64_metas<K>::unmap_user_key(key);
+    auto decoded = Morton<key_type>::decode(key);
     return hash(decoded[0], decoded[1], decoded[2]);
   }
 };
@@ -175,8 +201,11 @@ template <typename K> struct IdentityHash {
   using key_type = tv::hash::to_unsigned_t<K>;
 
   TV_HOST_DEVICE_INLINE static key_type hash(key_type k) { return k; }
-  TV_HOST_DEVICE_INLINE static key_type encode(key_type x) { return x; }
+  TV_HOST_DEVICE_INLINE static key_type encode(key_type x) { 
+    return detail::platform_not_support_atomic_64_metas<K>::map_user_key(x);
+  }
   TV_HOST_DEVICE_INLINE static key_type hash_scalar(key_type key) {
+    key = detail::platform_not_support_atomic_64_metas<K>::unmap_user_key(key);
     return hash(key);
   }
 };
@@ -185,15 +214,16 @@ namespace detail {
 
 template <typename T> struct FNVInternal;
 template <> struct FNVInternal<uint32_t> {
-  constexpr static uint32_t defaultOffsetBasis = 0x811C9DC5;
-  constexpr static uint32_t prime = 0x01000193;
+  constexpr static TV_METAL_CONSTANT uint32_t defaultOffsetBasis = 0x811C9DC5;
+  constexpr static TV_METAL_CONSTANT uint32_t prime = 0x01000193;
 };
 
 template <> struct FNVInternal<uint64_t> {
-  constexpr static uint64_t defaultOffsetBasis = 0xcbf29ce484222325;
-  constexpr static uint64_t prime = 0x100000001b3;
+  constexpr static TV_METAL_CONSTANT uint64_t defaultOffsetBasis = 0xcbf29ce484222325;
+  constexpr static TV_METAL_CONSTANT uint64_t prime = 0x100000001b3;
 };
 
+#ifdef TV_CUDA_CC
 static constexpr bool kIsUint64SameAsULL =
     std::is_same<uint64_t, unsigned long long>::value;
 
@@ -203,7 +233,7 @@ struct FNVInternal<
   constexpr static unsigned long long defaultOffsetBasis = 0xcbf29ce484222325;
   constexpr static unsigned long long prime = 0x100000001b3;
 };
-
+#endif
 } // namespace detail
 
 template <typename K>
@@ -211,7 +241,7 @@ struct FNV1aHash : detail::FNVInternal<tv::hash::to_unsigned_t<K>> {
   using key_type = tv::hash::to_unsigned_t<K>;
   TV_HOST_DEVICE_INLINE static key_type hash(key_type key) {
     key_type ret = detail::FNVInternal<key_type>::defaultOffsetBasis;
-    key_type key_u = *(reinterpret_cast<key_type *>(&key));
+    key_type key_u = *(reinterpret_cast<TV_METAL_THREAD key_type *>(&key));
     // const char* key_ptr = reinterpret_cast<const char*>(&key);
     TV_PRAGMA_UNROLL
     for (size_t i = 0; i < sizeof(K); ++i) {
@@ -221,11 +251,19 @@ struct FNV1aHash : detail::FNVInternal<tv::hash::to_unsigned_t<K>> {
     }
     return ret;
   }
-  TV_HOST_DEVICE_INLINE static key_type encode(key_type x) { return x; }
+  TV_HOST_DEVICE_INLINE static key_type encode(key_type x) { 
+    return detail::platform_not_support_atomic_64_metas<K>::map_user_key(x);
+  }
   TV_HOST_DEVICE_INLINE static key_type hash_scalar(key_type key) {
+    key = detail::platform_not_support_atomic_64_metas<K>::unmap_user_key(key);
     return hash(key);
   }
 };
 
 } // namespace hash
 } // namespace tv
+
+#ifdef __METAL_VERSION__ 
+#pragma METAL internals : disable
+
+#endif

@@ -14,7 +14,8 @@
 
 #pragma once
 #include <chrono>
-#ifdef TV_CUDA
+#include <tensorview/core/defs.h>
+#if defined(TV_HARDWARE_ACC_CUDA)
 #include <cuda_runtime_api.h>
 #endif
 #include <iostream>
@@ -22,7 +23,7 @@
 
 namespace tv {
 
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
 template <typename TimeT = std::chrono::microseconds> struct CudaContextTimer {
   CudaContextTimer(bool enable = true) : enable_(enable) {
     if (enable_) {

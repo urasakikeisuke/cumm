@@ -131,3 +131,6 @@ settings.json
 __version__.py
 
 .vscode
+wheelhouse_tmp
+
+third_party/cccl

@@ -1,4 +1,4 @@
-// Copyright 2021 Yan Yan
+// Copyright 2024 Yan Yan
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@
 #include "half.h"
 #include "subint.h"
 #include "tf32.h"
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
 #include "float8.h"
 #include "complex.h"
 #endif

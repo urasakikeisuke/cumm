@@ -1,4 +1,4 @@
-// Copyright 2021 Yan Yan
+// Copyright 2024 Yan Yan
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 // limitations under the License.
 #pragma once
 #include "defs.h"
-#include <iostream>
 #include <sstream>
 #ifdef TV_USE_STACKTRACE
 #if defined(WIN32) || defined(_WIN32) ||                                       \
@@ -25,8 +24,14 @@
 #endif
 #include <boost/stacktrace.hpp>
 #endif
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
 #include <cuda.h>
+#endif
+// llvmlite currently don't support iostream
+#ifndef TV_LLVM_JIT
+#include <iostream>
+#else 
+#include "printf2.h"
 #endif
 #if defined(TV_USE_BOOST_TYPEOF) ||                                            \
     (!defined(__clang__) && defined(CUDA_VERSION) && CUDA_VERSION >= 11000)
@@ -67,7 +72,12 @@ void sstream_print(SStream &ss, T val, TArgs... args) {
 template <char Sep = ' ', class... TArgs> void ssprint(TArgs... args) {
   std::stringstream ss;
   sstream_print<Sep>(ss, args...);
+#ifndef TV_LLVM_JIT
   std::cout << ss.str() << std::endl;
+#else 
+  auto char_str = ss.str();
+  tv::printf2(char_str.c_str());
+#endif
 }
 
 #ifdef TV_USE_STACKTRACE

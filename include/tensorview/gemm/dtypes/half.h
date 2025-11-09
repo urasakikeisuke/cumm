@@ -40,9 +40,13 @@
 #if defined(__CUDACC_RTC__)
 #include "fp_nvrtc.h"
 #include <tensorview/core/nvrtc_std.h>
+#define CUDA_NAMESPACE_STD cuda::std
+
 #undef CUTLASS_ENABLE_F16C
 #define CUTLASS_ENABLE_F16C 0
 #else
+#define CUDA_NAMESPACE_STD std
+
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -334,7 +338,7 @@ struct alignas(2) half_t {
   half_t() : storage(0) {}
 
   /// Reinterpret cast from CUDA's half type
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
   TV_HOST_DEVICE_INLINE
   explicit half_t(half const &x)
       : storage(reinterpret_cast<uint16_t const &>(x)) {}
@@ -355,7 +359,7 @@ struct alignas(2) half_t {
   TV_HOST_DEVICE_INLINE
   explicit half_t(unsigned x) { storage = convert(x).storage; }
 
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
   /// Assignment
   TV_HOST_DEVICE_INLINE
   half_t &operator=(half const &x) {
@@ -379,7 +383,7 @@ struct alignas(2) half_t {
   TV_HOST_DEVICE_INLINE
   operator bool() const { return (convert(*this) != 0.0f); }
 
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
   /// Bitcasts to CUDA's half type
   TV_HOST_DEVICE_INLINE
   half to_half() const { return reinterpret_cast<half const &>(storage); }
@@ -493,7 +497,7 @@ half_t copysign(half_t const &a, half_t const &b) {
 //
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-namespace std {
+namespace CUDA_NAMESPACE_STD {
 
 #if !defined(__CUDACC_RTC__)
 /// Numeric limits

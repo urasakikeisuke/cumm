@@ -1,4 +1,4 @@
-// Copyright 2021 Yan Yan
+// Copyright 2024 Yan Yan
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,8 +15,9 @@
 #pragma once
 #include "array.h"
 #include "defs.h"
-#ifndef __CUDACC_RTC__
+#ifndef TV_PARALLEL_RTC
 #include <cstdio>
+#include <cstdint>
 #endif
 #include "const_string.h"
 namespace tv {
@@ -119,6 +120,10 @@ template <class T, size_t N> struct type_to_format<T[N]> {
   static constexpr auto value = generate_array_format<T, N>();
 };
 
+template <size_t N> struct type_to_format<const char[N]> {
+  static constexpr auto value = type_to_format<const char *>::value;
+};
+
 template <char Sep, class... Ts> struct types_to_format;
 
 template <char Sep, class T> struct types_to_format<Sep, T> {
@@ -144,41 +149,32 @@ TV_HOST_DEVICE_INLINE void printf2(Ts... args) {
 
 template <char Sep = ' ', unsigned Tx = 0, class... Ts>
 TV_HOST_DEVICE_INLINE void printf2_once(Ts... args) {
-  // this function should only be used for cuda code. host code
-  // should use tv::ssprint.
-  static constexpr auto fmt = detail::types_to_format<Sep, Ts...>::value;
 #if defined(__CUDA_ARCH__)
   if ((threadIdx.x == Tx && threadIdx.y == 0 && threadIdx.z == 0 &&
        blockIdx.x == 0 && blockIdx.y == 0))
-    printf(fmt.c_str(), args...);
+    printf2<Sep>(args...);
 #else
-  printf(fmt.c_str(), args...);
+  printf2<Sep>(args...);
 #endif
 }
 
 template <char Sep = ' ', class... Ts>
 TV_HOST_DEVICE_INLINE void printf2_block_once(Ts... args) {
-  // this function should only be used for cuda code. host code
-  // should use tv::ssprint.
-  static constexpr auto fmt = detail::types_to_format<Sep, Ts...>::value;
 #if defined(__CUDA_ARCH__)
   if ((blockIdx.x == 0 && blockIdx.y == 0))
-    printf(fmt.c_str(), args...);
+    printf2<Sep>(args...);
 #else
-  printf(fmt.c_str(), args...);
+  printf2<Sep>(args...);
 #endif
 }
 
 template <char Sep = ' ', class... Ts>
 TV_HOST_DEVICE_INLINE void printf2_thread_once(Ts... args) {
-  // this function should only be used for cuda code. host code
-  // should use tv::ssprint.
-  static constexpr auto fmt = detail::types_to_format<Sep, Ts...>::value;
 #if defined(__CUDA_ARCH__)
   if ((threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0))
-    printf(fmt.c_str(), args...);
+    printf2<Sep>(args...);
 #else
-  printf(fmt.c_str(), args...);
+  printf2<Sep>(args...);
 #endif
 }
 
@@ -190,7 +186,7 @@ printf2_array_impl(array<T, N> arg, mp_list_int<Indexes...>, Ts &&...args) {
   // this function should only be used for cuda code. host code
   // should use tv::ssprint.
   static constexpr auto fmt =
-      detail::types_to_format<Sep, array<T, N>, Ts...>::value;
+      types_to_format<Sep, array<T, N>, Ts...>::value;
   printf(fmt.c_str(), arg[Indexes]..., args...);
 }
 
@@ -200,7 +196,7 @@ printf2_array_impl(T const (&arg)[N], mp_list_int<Indexes...>, Ts &&...args) {
   // this function should only be used for cuda code. host code
   // should use tv::ssprint.
   static constexpr auto fmt =
-      detail::types_to_format<Sep, array<T, N>, Ts...>::value;
+      types_to_format<Sep, array<T, N>, Ts...>::value;
   printf(fmt.c_str(), arg[Indexes]..., args...);
 }
 
@@ -246,3 +242,15 @@ TV_HOST_DEVICE_INLINE void printf2_array_block_once(Ts &&...args) {
 }
 
 } // namespace tv
+
+#define TV_DEVICE_ASSERT(x)                                            \
+  if (!(x)) {                                                                   \
+    tv::printf2("Device Assert:", #x);                                                       \
+    assert(x);                                                                 \
+  }
+
+#define TV_DEVICE_ASSERT_WITH_PRINT(x, ...)                                            \
+  if (!(x)) {                                                                   \
+    tv::printf2("Device Assert:", #x, __VA_ARGS__);                                                       \
+    assert(x);                                                                 \
+  }

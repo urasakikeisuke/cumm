@@ -1,4 +1,4 @@
-// Copyright 2021 Yan Yan
+// Copyright 2024 Yan Yan
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 
 namespace tv {
 
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
 
 #ifdef __DRIVER_TYPES_H__
 #ifndef DEVICE_RESET

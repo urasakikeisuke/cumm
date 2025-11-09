@@ -1,4 +1,4 @@
-// Copyright 2021 Yan Yan
+// Copyright 2024 Yan Yan
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,19 +13,20 @@
 // limitations under the License.
 
 #pragma once
-#ifdef TV_CUDA
+#include <tensorview/core/defs.h>
+#if defined(TV_HARDWARE_ACC_CUDA)
 // #include <cuda.h>
 #include <cuda_fp16.h>
 #endif
-#if (CUDA_VERSION >= 11000 && defined(TV_CUDA))
+#if (CUDA_VERSION >= 11000 && defined(TV_HARDWARE_ACC_CUDA))
 #include <cuda_bf16.h>
 #endif
-#if (CUDA_VERSION >= 11080 && defined(TV_CUDA))
+#if (CUDA_VERSION >= 11080 && defined(TV_HARDWARE_ACC_CUDA))
 #include <cuda_fp8.h>
 #endif
 
 #include <tensorview/core/defs.h>
-#ifdef __CUDACC_RTC__
+#ifdef TV_PARALLEL_RTC
 #include <tensorview/core/nvrtc_std.h>
 #else
 #include <algorithm>
@@ -61,17 +62,6 @@ enum DType {
   custom128 = 106,
   unknown = -1
 };
-
-/*
-#ifdef TV_CUDA
-using half_t = __half;
-using half2_t = __half2;
-#endif
-#if (CUDA_VERSION >= 11000 && defined(TV_CUDA))
-using bfloat16_t = __nv_bfloat16;
-using bfloat162_t = __nv_bfloat162;
-#endif
-*/
 
 namespace detail {
 
@@ -110,17 +100,17 @@ template <typename T> struct TypeToDtype {
 template <> struct TypeToDtype<int32_t> {
   static constexpr DType dtype = int32;
 };
-#ifdef TV_CUDA
+#if defined(TV_HARDWARE_ACC_CUDA)
 template <> struct TypeToDtype<__half> {
   static constexpr DType dtype = float16;
 };
 #endif
-#if (CUDA_VERSION >= 11000 && defined(TV_CUDA))
+#if (CUDA_VERSION >= 11000 && defined(TV_HARDWARE_ACC_CUDA))
 template <> struct TypeToDtype<__nv_bfloat16> {
   static constexpr DType dtype = bfloat16;
 };
 #endif
-#if (CUDA_VERSION >= 11080 && defined(TV_CUDA))
+#if (CUDA_VERSION >= 11080 && defined(TV_HARDWARE_ACC_CUDA))
 template <> struct TypeToDtype<__nv_fp8_e5m2> {
   static constexpr DType dtype = float_e5m2;
 };

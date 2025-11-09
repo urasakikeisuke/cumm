@@ -1,4 +1,4 @@
-// Copyright 2021 Yan Yan
+// Copyright 2024 Yan Yan
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,8 +18,12 @@
 #include "const_ops.h"
 #include "defs.h"
 #include "mp_helper.h"
+#ifndef TV_METAL_RTC
 #include "printf2.h"
-#ifndef __CUDACC_RTC__
+#endif
+#ifndef TV_PARALLEL_RTC
 #include "cc17.h"
 #endif
+#ifndef TV_METAL_RTC
 #include "const_string.h"
+#endif
